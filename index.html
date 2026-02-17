@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU AI Assistant</title>
+    <!-- 引入样式和图标 -->
+    <script src="https://cdn.jsdelivr.net"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com">
+    <script src="https://cdnjs.cloudflare.com"></script>
+    <style>
+        :root { --sidebar-width: 260px; --primary-color: #10a37f; }
+        body { font-family: -apple-system, sans-serif; display: flex; height: 100vh; margin: 0; background: #343541; color: white; }
+        
+        /* 侧边栏：对话管理 */
+        #sidebar { width: var(--sidebar-width); background: #202123; padding: 10px; display: flex; flex-direction: column; border-right: 1px solid #4d4d4f; }
+        .nav-btn { padding: 12px; border: 1px solid #4d4d4f; border-radius: 5px; cursor: pointer; margin-bottom: 10px; transition: 0.3s; text-align: center; }
+        .nav-btn:hover { background: #2b2c2f; }
+        #chat-list { flex: 1; overflow-y: auto; }
+        .chat-item { padding: 10px; margin: 5px 0; border-radius: 5px; cursor: pointer; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .chat-item:hover, .chat-item.active { background: #343541; }
+
+        /* 主界面 */
+        #main { flex: 1; display: flex; flex-direction: column; position: relative; }
+        #header { padding: 10px 20px; border-bottom: 1px solid #4d4d4f; display: flex; justify-content: space-between; align-items: center; }
+        #chat-container { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 20px; }
+        
+        /* 消息样式 */
+        .msg { max-width: 85%; padding: 15px; border-radius: 10px; line-height: 1.6; position: relative; }
+        .msg.user { align-self: flex-end; background: #444654; }
+        .msg.ai { align-self: flex-start; background: transparent; width: 100%; }
+        
+        /* 代码块与复制按钮 */
+        pre { position: relative; background: #000; padding: 15px; border-radius: 8px; overflow-x: auto; }
+        .copy-btn { position: absolute; right: 10px; top: 10px; background: #444; color: #fff; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+        
+        /* 输入区 */
+        #input-area { padding: 20px; background: linear-gradient(transparent, #343541 50%); }
+        .input-wrapper { max-width: 800px; margin: 0 auto; position: relative; }
+        textarea { width: 100%; background: #40414f; border: 1px solid #565869; border-radius: 10px; color: white; padding: 15px; resize: none; outline: none; box-sizing: border-box; }
+        
+        #loading-status { font-size: 12px; color: #aaa; text-align: center; margin-bottom: 5px; }
+    </style>
+</head>
+<body>
+
+<div id="sidebar">
+    <div class="nav-btn" onclick="createNewChat()">+ 新建对话</div>
+    <div id="chat-list"></div>
+</div>
+
+<div id="main">
+    <div id="header">
+        <select id="model-selector" onchange="switchModel()">
+            <option value="Llama-3.1-8B-Instruct-q4f16_1-MLC">Llama 3.1 8B (通用)</option>
+            <option value="Qwen2.5-Coder-7B-Instruct-q4f16_1-MLC">Qwen 2.5 Coder (编程增强)</option>
+            <option value="Phi-3-mini-4k-instruct-q4f16_1-MLC">Phi-3 Mini (轻量快)</option>
+        </select>
+        <div id="engine-status">等待初始化...</div>
+    </div>
+
+    <div id="chat-container"></div>
+
+    <div id="input-area">
+        <div id="loading-status"></div>
+        <div class="input-wrapper">
+            <textarea id="user-input" rows="3" placeholder="输入消息... (Shift+Enter换行)"></textarea>
+        </div>
+    </div>
+</div>
+
+<script type="module">
+    import * as webllm from "https://esm.run";
+
+    let engine;
+    let currentChatId = null;
+    let chats = JSON.parse(localStorage.getItem('ai_chats') || '[]');
+
+    // 初始化渲染
+    renderChatList();
+    if(chats.length > 0) loadChat(chats[0].id); else createNewChat();
+
+    async function initEngine() {
+        if (engine) return;
+        const modelId = document.getElementById('model-selector').value;
+        engine = new webllm.MLCEngine();
+        engine.setInitProgressCallback((report) => {
+            document.getElementById('loading-status').innerText = report.text;
+        });
+        await engine.reload(modelId);
+        document.getElementById('engine-status').innerText = "模型就绪";
+    }
+
+    // 核心对话逻辑
+    async function sendMessage() {
+        const input = document.getElementById('user-input');
+        const text = input.value.trim();
+        if (!text) return;
+
+        if (!engine) await initEngine();
+
+        const chat = chats.find(c => c.id === currentChatId);
+        chat.messages.push({ role: "user", content: text });
+        input.value = '';
+        renderMessages();
+
+        const aiMsgObj = { role: "assistant", content: "" };
+        chat.messages.push(aiMsgObj);
+        
+        const chunks = await engine.chat.completions.create({
+            messages: chat.messages.slice(0, -1),
+            stream: true
+        });
+
+        let fullReply = "";
+        for await (const chunk of chunks) {
+            fullReply += chunk.choices[0]?.delta?.content || "";
+            aiMsgObj.content = fullReply;
+            renderMessages();
+        }
+        
+        saveToLocal();
+    }
+
+    // UI 渲染与功能
+    function renderMessages() {
+        const container = document.getElementById('chat-container');
+        const chat = chats.find(c => c.id === currentChatId);
+        container.innerHTML = chat.messages.map(m => `
+            <div class="msg ${m.role === 'user' ? 'user' : 'ai'}">
+                ${marked.parse(m.content)}
+            </div>
+        `).join('');
+        
+        // 绑定代码复制
+        container.querySelectorAll('pre code').forEach((block) => {
+            if (block.parentElement.querySelector('.copy-btn')) return;
+            const btn = document.createElement('button');
+            btn.className = 'copy-btn';
+            btn.innerText = '复制';
+            btn.onclick = () => {
+                navigator.clipboard.writeText(block.innerText);
+                btn.innerText = '已复制！';
+                setTimeout(() => btn.innerText = '复制', 2000);
+            };
+            block.parentElement.appendChild(btn);
+            hljs.highlightElement(block);
+        });
+        container.scrollTop = container.scrollHeight;
+    }
+
+    function createNewChat() {
+        const id = Date.now();
+        chats.unshift({ id, title: "新对话 " + new Date().toLocaleTimeString(), messages: [] });
+        currentChatId = id;
+        saveToLocal();
+        renderChatList();
+        renderMessages();
+    }
+
+    function loadChat(id) {
+        currentChatId = id;
+        renderChatList();
+        renderMessages();
+    }
+
+    function renderChatList() {
+        const list = document.getElementById('chat-list');
+        list.innerHTML = chats.map(c => `
+            <div class="chat-item ${c.id === currentChatId ? 'active' : ''}" onclick="loadChat(${c.id})">
+                ${c.title}
+            </div>
+        `).join('');
+    }
+
+    function saveToLocal() {
+        localStorage.setItem('ai_chats', JSON.stringify(chats));
+    }
+
+    // 事件监听
+    document.getElementById('user-input').addEventListener('keydown', e => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendMessage();
+        }
+    });
+
+    window.createNewChat = createNewChat;
+    window.loadChat = loadChat;
+    window.switchModel = async () => {
+        engine = null;
+        document.getElementById('engine-status').innerText = "切换模型中...";
+        await initEngine();
+    };
+</script>
+</body>
+</html>
